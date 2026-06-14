@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "author": "Hokoro",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "board-esp32-devkit-c-v4",
+      "id": "esp",
+      "top": 0,
+      "left": 0,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-neopixel-matrix",
+      "id": "matrix1",
+      "top": -200,
+      "left": 250,
+      "attrs": {
+        "rows": "5",
+        "cols": "5",
+        "pixelSpacing": "14"
+      }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn1",
+      "top": 100,
+      "left": 280,
+      "attrs": {
+        "color": "green",
+        "label": "MODE"
+      }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r1",
+      "top": 50,
+      "left": 180,
+      "attrs": { "value": "10000" }
+    }
+  ],
+  "connections": [
+    [ "esp:GND.1", "matrix1:GND",  "black", [] ],
+    [ "esp:5V",    "matrix1:VCC",  "red",   [] ],
+    [ "esp:27",    "matrix1:DIN",  "green", [] ],
+    [ "esp:VN",    "btn1:1.l",     "blue",  [] ],
+    [ "btn1:2.l",  "esp:GND.2",    "black", [] ],
+    [ "esp:VN",    "r1:1",         "blue",  [] ],
+    [ "r1:2",      "esp:3V3",      "red",   [] ]
+  ],
+  "dependencies": {}
+}
