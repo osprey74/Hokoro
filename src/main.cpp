@@ -11,10 +11,13 @@
 //
 //  ボタン操作 (M5Atom 内蔵ボタン / G39):
 //    - 通常/手動モード中の短押し : NORMAL/MANUAL 巡回 (NORMAL では 400ms 遅延発火)
-//    - NORMAL モード中のダブルクリック: 進行中/超過の予定を「終了確定」して dismiss
+//    - NORMAL ダブルクリック (進行中/超過時): 予定を「終了確定」して dismiss
+//    - NORMAL ダブルクリック (idle 時)     : FONT_TEST モードへ (フォント確認)
 //    - 通常/手動モード中の長押し2秒: WIFI_SELECT (Wi-Fi プロファイル切替) へ
 //    - WIFI_SELECT 中の短押し    : 候補プロファイル巡回 (上段ドットで番号表示)
 //    - WIFI_SELECT 中の長押し1秒 : 候補プロファイルへ接続切替を確定
+//    - FONT_TEST 中の短押し      : 次のグリフへ即時遷移
+//    - FONT_TEST 中の長押し1秒   : NORMAL へ復帰
 //    ※ デバウンスは M5.Btn が吸収
 //
 //  Target: M5Stack Atom Matrix v1.1 (ESP32-PICO-D4)
@@ -36,12 +39,17 @@ static const uint32_t LONGPRESS_WS_MS = 1000;           // WIFI_SELECT 中の確
 static const uint32_t DOUBLE_CLICK_MS = 400;            // ダブルクリック判定窓 (NORMAL モードのみ)
 
 // ---------------- モード定義 ----------------
-enum class Mode { NORMAL, MANUAL, WIFI_SELECT };
+enum class Mode { NORMAL, MANUAL, WIFI_SELECT, FONT_TEST };
 enum class Manual { LUNCH, AWAY, BREAK };
 
 static Mode    g_mode   = Mode::NORMAL;
 static Manual  g_manual = Manual::LUNCH;
 static int     g_wifiCandidate = 0;   // WIFI_SELECT 中の選択候補 index
+
+// FONT_TEST モード
+static size_t   g_fontTestIdx     = 0;
+static uint32_t g_fontTestStartMs = 0;
+static const uint32_t FONT_TEST_MS = 2500;     // 1グリフあたりの自動進み時間
 
 // ボタン長押し検出用
 static uint32_t g_btnPressStartMs = 0;
@@ -210,10 +218,14 @@ static void onButtonShortPress() {
     // プロファイル候補をローテート
     g_wifiCandidate = (g_wifiCandidate + 1) % wifip::COUNT;
     Serial.printf("[wifi-select] candidate -> #%d\n", g_wifiCandidate + 1);
+  } else if (g_mode == Mode::FONT_TEST) {
+    // 次のグリフへ進める (即時)
+    g_fontTestIdx = (g_fontTestIdx + 1) % disp::FONT_COUNT;
+    g_fontTestStartMs = millis();
   }
 }
 
-// 長押し: WIFI_SELECT への遷移、または WIFI_SELECT 内での確定
+// 長押し: WIFI_SELECT への遷移、WIFI_SELECT 内での確定、または FONT_TEST 退出
 static void onButtonLongPress() {
   if (g_mode == Mode::NORMAL || g_mode == Mode::MANUAL) {
     g_mode = Mode::WIFI_SELECT;
@@ -221,18 +233,26 @@ static void onButtonLongPress() {
     Serial.printf("[btn-long] -> WIFI_SELECT (current=#%d)\n", g_wifiCandidate + 1);
   } else if (g_mode == Mode::WIFI_SELECT) {
     confirmWifiSelection();
+  } else if (g_mode == Mode::FONT_TEST) {
+    Serial.println("[btn-long] FONT_TEST -> NORMAL");
+    g_mode = Mode::NORMAL;
   }
 }
 
-// ダブルクリック: NORMAL モードで進行中/超過の予定を「終了確定」して dismiss
+// ダブルクリック: 進行中/超過の予定があれば「終了確定」で dismiss、
+//                 NORMAL で idle なら FONT_TEST モードへ入る。
 static void onButtonDoubleClick() {
-  if (g_mode == Mode::NORMAL && g_currentActiveEvent.start != 0) {
+  if (g_mode != Mode::NORMAL) return;
+  if (g_currentActiveEvent.start != 0) {
     g_dismissedEnd = g_currentActiveEvent.end;
     Serial.printf("[btn-dc] event dismissed (end=%s)\n",
                   fmtJst(g_dismissedEnd).c_str());
     M5.dis.clear();
   } else {
-    Serial.println("[btn-dc] no active event to dismiss");
+    g_mode = Mode::FONT_TEST;
+    g_fontTestIdx = 0;
+    g_fontTestStartMs = 0;
+    Serial.println("[btn-dc] -> FONT_TEST");
   }
 }
 
@@ -251,7 +271,8 @@ static void handleButton() {
   // 長押し判定
   if (M5.Btn.isPressed() && !g_btnLongFired) {
     uint32_t held = nowMs - g_btnPressStartMs;
-    uint32_t thresh = (g_mode == Mode::WIFI_SELECT) ? LONGPRESS_WS_MS : LONGPRESS_MS;
+    uint32_t thresh = (g_mode == Mode::WIFI_SELECT || g_mode == Mode::FONT_TEST)
+                      ? LONGPRESS_WS_MS : LONGPRESS_MS;
     if (held >= thresh) {
       onButtonLongPress();
       g_btnLongFired = true;
@@ -369,6 +390,30 @@ static void renderWifiSelect(uint32_t /*nowMs*/) {
   disp::drawProfileIndicator(g_wifiCandidate + 1, disp::COL_WIFI);
 }
 
+// ---------------- FONT_TEST モード描画 ----------------
+//   実装済みグリフを中央寄せで1文字ずつ表示し、FONT_TEST_MS 毎に自動で次へ。
+//   ボタン短押しで即座に次へ、長押し1秒で NORMAL 復帰。
+static void renderFontTest(uint32_t nowMs) {
+  if (g_fontTestStartMs == 0) {
+    g_fontTestStartMs = nowMs;
+  } else if (nowMs - g_fontTestStartMs >= FONT_TEST_MS) {
+    g_fontTestStartMs = nowMs;
+    g_fontTestIdx = (g_fontTestIdx + 1) % disp::FONT_COUNT;
+  }
+  disp::drawGlyphCentered(&disp::FONT[g_fontTestIdx], disp::COL_AWAY);
+
+  // シリアルへ現在表示中のグリフを (idx 変更時のみ) 出力
+  static size_t s_lastLoggedIdx = (size_t)-1;
+  if (g_fontTestIdx != s_lastLoggedIdx) {
+    const disp::Glyph& g = disp::FONT[g_fontTestIdx];
+    Serial.printf("[font-test] [%u/%u] '%c' (width=%u)\n",
+                  (unsigned)(g_fontTestIdx + 1),
+                  (unsigned)disp::FONT_COUNT,
+                  g.c, (unsigned)g.width);
+    s_lastLoggedIdx = g_fontTestIdx;
+  }
+}
+
 // ---------------- Arduino ----------------
 void setup() {
   M5.begin(true, false, true); // Serial, I2C=false, Display=true
@@ -397,6 +442,7 @@ void loop() {
     case Mode::NORMAL:      renderNormal(nowMs);      break;
     case Mode::MANUAL:      renderManual(nowMs);      break;
     case Mode::WIFI_SELECT: renderWifiSelect(nowMs);  break;
+    case Mode::FONT_TEST:   renderFontTest(nowMs);    break;
   }
 
   delay(10);
