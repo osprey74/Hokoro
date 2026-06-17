@@ -22,6 +22,11 @@ constexpr uint32_t COL_BREAK  = 0x108040; // BREAK: 緑
 constexpr uint32_t COL_PROG   = 0x104060; // 残量バー: 青系
 constexpr uint32_t COL_OVER   = 0xC00000; // 超過: 赤（点滅）
 
+// WIFI_SELECT モード用
+constexpr uint32_t COL_WIFI     = 0x0080C0; // 選択中インジケータ: シアン
+constexpr uint32_t COL_WIFI_OK  = 0x00C040; // 接続成功フィードバック: 緑
+constexpr uint32_t COL_WIFI_NG  = 0xC02000; // 接続失敗フィードバック: 赤
+
 // ---- 3x5 フォント（必要英字のみ。各列5bit、上位bit=最上段）----
 //  1 グリフ = 3 列。bit4(0x10)=row0 ... bit0(0x01)=row4
 struct Glyph { char c; uint8_t col[3]; };
@@ -50,11 +55,16 @@ inline const uint8_t* glyphFor(char c) {
   return FONT[sizeof(FONT)/sizeof(FONT[0]) - 1].col; // space fallback
 }
 
-// drawpix ラッパ。シミュレータ時のみ Wokwi のチェイン方向差を吸収するため
-// 180°反転（idx → 24-idx）して描画する。実機ビルドでは素通し。
+// drawpix ラッパ。設置向きに合わせて idx を変換する。
+//   シミュレータ: Wokwi のチェイン方向差を補正する 180° 回転 (idx → 24 - idx)
+//   実機       : 物理設置向きに合わせて縦反転 (= 180° + 左右反転)
 inline void put(int idx, uint32_t color) {
 #ifdef HOKORO_SIM
   idx = 24 - idx;
+#else
+  int x = idx % 5;
+  int y = idx / 5;
+  idx = (4 - y) * 5 + x;   // 縦反転
 #endif
   M5.dis.drawpix(idx, color);
 }
@@ -85,6 +95,8 @@ inline void drawScrollFrame(const uint8_t* cols, size_t n,
 }
 
 // 残り時間プログレス: 0..25 ドットを点灯。over=true で警告色点滅。
+//   実機: 物理 top-left (drawpix(0)) から右へ消えていく順。
+//   sim : Wokwi のチェイン方向に従い put() 経由で従来挙動を維持。
 inline void drawProgress(int litDots, uint32_t color,
                          bool over, bool blinkOn) {
   M5.dis.clear();
@@ -93,7 +105,27 @@ inline void drawProgress(int litDots, uint32_t color,
     return;
   }
   litDots = constrain(litDots, 0, 25);
+#ifdef HOKORO_SIM
   for (int i = 0; i < litDots; ++i) put(i, color);
+#else
+  // drawpix(0) = 物理 top-left。最初の (25 - litDots) 個を未点灯にする。
+  for (int i = 25 - litDots; i < 25; ++i) M5.dis.drawpix(i, color);
+#endif
+}
+
+// 全面塗りつぶし (接続中フィードバック等で使用)
+inline void drawFill(uint32_t color) {
+  for (int i = 0; i < 25; ++i) put(i, color);
+}
+
+// WIFI_SELECT モード用: 上段(row 0) に N 個ドットを点灯してプロファイル番号を表現。
+//   profile 1 → 1 ドット、profile 3 → 3 ドット
+inline void drawProfileIndicator(int oneBasedIndex, uint32_t color) {
+  M5.dis.clear();
+  int n = constrain(oneBasedIndex, 0, 5);
+  for (int x = 0; x < n; ++x) {
+    put(0 * 5 + x, color);  // row 0
+  }
 }
 
 } // namespace disp

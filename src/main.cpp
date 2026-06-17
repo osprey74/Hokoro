@@ -10,8 +10,11 @@
 //    - 各ステータス文字を横スクロール表示
 //
 //  ボタン操作 (M5Atom 内蔵ボタン / G39):
-//    - 通常モード中の短押し  : MANUAL へ入り LUNCH 表示
-//    - 手動モード中の短押し  : LUNCH→AWAY→BREAK→(NORMAL復帰) を巡回
+//    - 通常/手動モード中の短押し : NORMAL/MANUAL 巡回 (NORMAL では 400ms 遅延発火)
+//    - NORMAL モード中のダブルクリック: 進行中/超過の予定を「終了確定」して dismiss
+//    - 通常/手動モード中の長押し2秒: WIFI_SELECT (Wi-Fi プロファイル切替) へ
+//    - WIFI_SELECT 中の短押し    : 候補プロファイル巡回 (上段ドットで番号表示)
+//    - WIFI_SELECT 中の長押し1秒 : 候補プロファイルへ接続切替を確定
 //    ※ デバウンスは M5.Btn が吸収
 //
 //  Target: M5Stack Atom Matrix v1.1 (ESP32-PICO-D4)
@@ -20,23 +23,39 @@
 #include <WiFi.h>
 #include "secrets.h"      // ← secrets.example.h をコピーして作成
 #include "display.h"
-#include "ical.h"
+#include "schedule.h"
+#include "wifi_profiles.h"
 
 // ---------------- 設定値 ----------------
-static const uint32_t ICAL_POLL_MS   = 60UL * 1000UL;  // iCal 取得間隔(1分)
-static const uint32_t SCROLL_STEP_MS = 200;            // スクロール速度
-static const uint32_t TOGGLE_MS      = 10000;          // 残量/MTG切替間隔
-static const uint32_t BLINK_MS       = 500;            // 超過点滅間隔
+static const uint32_t POLL_MS         = 60UL * 1000UL;  // 予定 JSON 取得間隔(1分)
+static const uint32_t SCROLL_STEP_MS  = 200;            // スクロール速度
+static const uint32_t TOGGLE_MS       = 10000;          // 残量/MTG切替間隔
+static const uint32_t BLINK_MS        = 500;            // 超過点滅間隔
+static const uint32_t LONGPRESS_MS    = 2000;           // NORMAL/MANUAL→WIFI_SELECT 入りの長押し閾値
+static const uint32_t LONGPRESS_WS_MS = 1000;           // WIFI_SELECT 中の確定長押し閾値
+static const uint32_t DOUBLE_CLICK_MS = 400;            // ダブルクリック判定窓 (NORMAL モードのみ)
 
 // ---------------- モード定義 ----------------
-enum class Mode { NORMAL, MANUAL };
+enum class Mode { NORMAL, MANUAL, WIFI_SELECT };
 enum class Manual { LUNCH, AWAY, BREAK };
 
 static Mode    g_mode   = Mode::NORMAL;
 static Manual  g_manual = Manual::LUNCH;
+static int     g_wifiCandidate = 0;   // WIFI_SELECT 中の選択候補 index
+
+// ボタン長押し検出用
+static uint32_t g_btnPressStartMs = 0;
+static bool     g_btnLongFired    = false;
+
+// ダブルクリック検出用 (NORMAL モードのみ)
+static uint32_t g_btnLastReleaseMs = 0;   // 0 = pending なし
+
+// 「終了確定」状態
+static schedule::Event g_currentActiveEvent;   // renderNormal で毎フレーム更新
+static time_t          g_dismissedEnd = 0;     // dismiss された予定の end epoch
 
 // ---------------- 状態 ----------------
-static ical::Event g_event;
+static schedule::List g_eventList;
 static uint32_t g_lastPoll   = 0;
 static uint32_t g_lastScroll = 0;
 static uint32_t g_lastToggle = 0;
@@ -57,6 +76,16 @@ static String   g_scrollText = "";
 static constexpr time_t SIM_BASE_EPOCH = 1700000000;
 #endif
 
+// UTC epoch を JST 文字列 "MM/DD HH:MM" に整形（ログ可読化用）
+static String fmtJst(time_t epoch) {
+  time_t jst = epoch + 9 * 3600;
+  struct tm tm;
+  gmtime_r(&jst, &tm);
+  char buf[24];
+  strftime(buf, sizeof(buf), "%m/%d %H:%M", &tm);
+  return String(buf);
+}
+
 static time_t nowJst() {
 #ifdef HOKORO_SIM
   // シミュレータ時は millis()ベースの擬似時刻（起動からの経過秒 + ベース）
@@ -71,10 +100,10 @@ static time_t nowJst() {
 // シミュレータ用: 60秒間のダミーMTGを注入。経過後は自動的に超過点滅へ遷移。
 static void initSimEvent() {
   time_t now = nowJst();
-  g_event.valid   = true;
-  g_event.start   = now;
-  g_event.end     = now + 60;  // 60秒で終了 → 以降は赤点滅
-  g_event.summary = "MTG";
+  g_eventList.valid = true;
+  g_eventList.count = 1;
+  g_eventList.events[0].start = now;
+  g_eventList.events[0].end   = now + 60;  // 60秒で終了 → 以降は赤点滅
 }
 #endif
 
@@ -105,63 +134,199 @@ static const char* manualLabel() {
 
 // ---------------- Wi-Fi / 時刻 ----------------
 static void connectWifi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
-    delay(250);
-  }
+  wifip::loadCurrent();
+  Serial.printf("[wifi] %d profile(s) configured, starting from #%d\n",
+                wifip::COUNT, wifip::current() + 1);
+  wifip::connectAuto();
 }
 
 static void syncTime() {
+  Serial.println("[ntp] syncing...");
   // NTP。比較は epoch(UTC) で統一するため gmtoffset=0 で取得。
   configTime(0, 0, NTP_SERVER);
   uint32_t t0 = millis();
   while (time(nullptr) < 100000 && millis() - t0 < 8000) delay(200);
+  time_t now = time(nullptr);
+  if (now > 100000) {
+    Serial.printf("[ntp] synced, epoch=%ld\n", (long)now);
+  } else {
+    Serial.println("[ntp] FAILED");
+  }
 }
 
 // ---------------- ボタン ----------------
-static void onButton() {
+// 確定処理: 候補プロファイルへの接続切替
+static void confirmWifiSelection() {
+  Serial.printf("[wifi-select] confirming profile #%d\n", g_wifiCandidate + 1);
+
+  // 接続中フィードバック (シアン全面塗り)
+  disp::drawFill(disp::COL_WIFI);
+  delay(200);
+
+  bool ok = wifip::tryConnect(g_wifiCandidate);
+
+  // 結果フィードバック (緑/赤を 1秒間表示)
+  disp::drawFill(ok ? disp::COL_WIFI_OK : disp::COL_WIFI_NG);
+  delay(1000);
+  M5.dis.clear();
+
+  if (ok) {
+    wifip::saveCurrent(g_wifiCandidate);
+    syncTime();           // NTP 再同期
+    g_lastPoll = 0;       // iCal 即時再取得
+    g_mode = Mode::NORMAL;
+    Serial.println("[wifi-select] -> NORMAL");
+  } else {
+    // 失敗時は WIFI_SELECT に留まり、別プロファイルを試せるようにする
+    Serial.println("[wifi-select] connection failed, staying in WIFI_SELECT");
+  }
+}
+
+// 短押し: モード内で状態を進める
+static void onButtonShortPress() {
   if (g_mode == Mode::NORMAL) {
     g_mode = Mode::MANUAL;
     g_manual = Manual::LUNCH;
     setScrollText(manualLabel());
-  } else { // MANUAL: 巡回 → BREAK の次で NORMAL へ復帰
+    Serial.println("[btn] -> LUNCH");
+  } else if (g_mode == Mode::MANUAL) {
     switch (g_manual) {
-      case Manual::LUNCH: g_manual = Manual::AWAY;  setScrollText(manualLabel()); break;
-      case Manual::AWAY:  g_manual = Manual::BREAK; setScrollText(manualLabel()); break;
+      case Manual::LUNCH:
+        g_manual = Manual::AWAY;  setScrollText(manualLabel());
+        Serial.println("[btn] -> AWAY"); break;
+      case Manual::AWAY:
+        g_manual = Manual::BREAK; setScrollText(manualLabel());
+        Serial.println("[btn] -> BREAK"); break;
       case Manual::BREAK:
         g_mode = Mode::NORMAL;
         g_lastPoll = 0; /*即時更新*/
+        Serial.println("[btn] -> NORMAL");
 #ifdef HOKORO_SIM
         initSimEvent();   // ダミー予定をリセットして再スタート
 #endif
         break;
     }
+  } else if (g_mode == Mode::WIFI_SELECT) {
+    // プロファイル候補をローテート
+    g_wifiCandidate = (g_wifiCandidate + 1) % wifip::COUNT;
+    Serial.printf("[wifi-select] candidate -> #%d\n", g_wifiCandidate + 1);
+  }
+}
+
+// 長押し: WIFI_SELECT への遷移、または WIFI_SELECT 内での確定
+static void onButtonLongPress() {
+  if (g_mode == Mode::NORMAL || g_mode == Mode::MANUAL) {
+    g_mode = Mode::WIFI_SELECT;
+    g_wifiCandidate = wifip::current();
+    Serial.printf("[btn-long] -> WIFI_SELECT (current=#%d)\n", g_wifiCandidate + 1);
+  } else if (g_mode == Mode::WIFI_SELECT) {
+    confirmWifiSelection();
+  }
+}
+
+// ダブルクリック: NORMAL モードで進行中/超過の予定を「終了確定」して dismiss
+static void onButtonDoubleClick() {
+  if (g_mode == Mode::NORMAL && g_currentActiveEvent.start != 0) {
+    g_dismissedEnd = g_currentActiveEvent.end;
+    Serial.printf("[btn-dc] event dismissed (end=%s)\n",
+                  fmtJst(g_dismissedEnd).c_str());
+    M5.dis.clear();
+  } else {
+    Serial.println("[btn-dc] no active event to dismiss");
+  }
+}
+
+// ボタン入力ハンドラ: M5.update() の後に毎ループ呼ぶ
+//   NORMAL モード: short-press を DOUBLE_CLICK_MS 遅延発火、その間に2度目の release があれば
+//                  double-click として確定する。
+//   それ以外    : short-press は即時発火 (cycle 操作のレスポンス重視)。
+static void handleButton() {
+  uint32_t nowMs = millis();
+
+  if (M5.Btn.wasPressed()) {
+    g_btnPressStartMs = nowMs;
+    g_btnLongFired    = false;
+  }
+
+  // 長押し判定
+  if (M5.Btn.isPressed() && !g_btnLongFired) {
+    uint32_t held = nowMs - g_btnPressStartMs;
+    uint32_t thresh = (g_mode == Mode::WIFI_SELECT) ? LONGPRESS_WS_MS : LONGPRESS_MS;
+    if (held >= thresh) {
+      onButtonLongPress();
+      g_btnLongFired = true;
+      g_btnLastReleaseMs = 0;          // pending な short-press をキャンセル
+    }
+  }
+
+  // リリース処理
+  if (M5.Btn.wasReleased() && !g_btnLongFired) {
+    if (g_mode == Mode::NORMAL) {
+      if (g_btnLastReleaseMs != 0 && nowMs - g_btnLastReleaseMs < DOUBLE_CLICK_MS) {
+        // 2度目の release: double-click 確定
+        onButtonDoubleClick();
+        g_btnLastReleaseMs = 0;
+      } else {
+        // 1度目の release: double-click 窓を開始 (single short-press は遅延発火)
+        g_btnLastReleaseMs = nowMs;
+      }
+    } else {
+      // MANUAL / WIFI_SELECT は遅延なしで cycle
+      onButtonShortPress();
+    }
+  }
+
+  // double-click 窓を超過しても2度目が来なければ single short-press 発火
+  if (g_btnLastReleaseMs != 0 && nowMs - g_btnLastReleaseMs >= DOUBLE_CLICK_MS) {
+    onButtonShortPress();
+    g_btnLastReleaseMs = 0;
   }
 }
 
 // ---------------- 通常モード描画 ----------------
 static void renderNormal(uint32_t nowMs) {
 #ifndef HOKORO_SIM
-  // ポーリング（実機ビルドのみ。シミュレータでは Wi-Fi/iCal をスキップ）
+  // ポーリング（実機ビルドのみ。シミュレータでは Wi-Fi/取得をスキップ）
   if (WiFi.status() == WL_CONNECTED &&
-      (g_lastPoll == 0 || nowMs - g_lastPoll >= ICAL_POLL_MS)) {
+      (g_lastPoll == 0 || nowMs - g_lastPoll >= POLL_MS)) {
     g_lastPoll = nowMs;
-    g_event = ical::fetchNext(ICAL_URL, nowJst());
+    Serial.println("[sched] fetching...");
+    schedule::List fetched = schedule::fetchAll(SCHEDULE_URL);
+    if (fetched.valid) {
+      g_eventList = fetched;   // 成功時のみ置換 (失敗時は前回データを保持)
+    }
   }
 #endif
 
   time_t now = nowJst();
 
-  // 進行中の予定が無ければ待機（消灯）
-  bool active = g_event.valid && now >= g_event.start && g_event.start != 0;
-  if (!active) { M5.dis.clear(); return; }
+  // 現在進行中 or 直近終了 (超過点滅) の予定を選出
+  // dismiss 済の予定は除外される
+  bool isOver = false;
+  schedule::Event ev = schedule::currentOrJustEnded(g_eventList, now, isOver, g_dismissedEnd);
+  g_currentActiveEvent = ev;   // ダブルクリックハンドラ参照用にキャッシュ
 
-  // 残量/超過の計算
-  long total = g_event.end - g_event.start;
-  long left  = g_event.end - now;
-  bool over  = left < 0;
+  // 状態遷移時のみログ出力（active 変化 or over 変化）
+  static time_t s_lastStart = -1;
+  static bool   s_lastOver  = false;
+  if (ev.start != s_lastStart || isOver != s_lastOver) {
+    if (ev.start != 0) {
+      Serial.printf("[sched] active: start=%s end=%s now=%s over=%d\n",
+                    fmtJst(ev.start).c_str(),
+                    fmtJst(ev.end).c_str(),
+                    fmtJst(now).c_str(),
+                    isOver ? 1 : 0);
+    } else {
+      Serial.printf("[sched] idle (now=%s)\n", fmtJst(now).c_str());
+    }
+    s_lastStart = ev.start;
+    s_lastOver  = isOver;
+  }
+
+  if (ev.start == 0) { M5.dis.clear(); return; }  // 待機
+
+  long total = ev.end - ev.start;
+  long left  = ev.end - now;
 
   // 表示トグル（残量ドット ⇄ MTG スクロール）
   if (nowMs - g_lastToggle >= TOGGLE_MS) {
@@ -170,7 +335,7 @@ static void renderNormal(uint32_t nowMs) {
     if (!g_showProg) setScrollText("MTG");
   }
 
-  if (over) { // 超過は最優先で点滅
+  if (isOver) {
     if (nowMs - g_lastBlink >= BLINK_MS) { g_lastBlink = nowMs; g_blinkOn = !g_blinkOn; }
     disp::drawProgress(0, disp::COL_OVER, true, g_blinkOn);
     return;
@@ -197,11 +362,22 @@ static void renderManual(uint32_t nowMs) {
   }
 }
 
+// ---------------- Wi-Fi 選択モード描画 ----------------
+//   選択中プロファイル番号を上段のN個ドットで表示。
+//   フォント不要、回路チェック前でも安全に表示可能。
+static void renderWifiSelect(uint32_t /*nowMs*/) {
+  disp::drawProfileIndicator(g_wifiCandidate + 1, disp::COL_WIFI);
+}
+
 // ---------------- Arduino ----------------
 void setup() {
   M5.begin(true, false, true); // Serial, I2C=false, Display=true
   M5.dis.clear();
+  delay(200);                  // シリアル安定化
+  Serial.println();
+  Serial.println("=== Hokoro starting ===");
 #ifdef HOKORO_SIM
+  Serial.println("[mode] HOKORO_SIM (sim event injected, wifi/ical skipped)");
   initSimEvent();              // Wi-Fi/NTPをスキップしダミー予定で起動
 #else
   connectWifi();
@@ -209,15 +385,19 @@ void setup() {
 #endif
   setScrollText("MTG");
   g_lastToggle = millis();
+  Serial.println("[setup] done, entering loop");
 }
 
 void loop() {
   M5.update();
-  if (M5.Btn.wasPressed()) onButton();
+  handleButton();
 
   uint32_t nowMs = millis();
-  if (g_mode == Mode::NORMAL) renderNormal(nowMs);
-  else                        renderManual(nowMs);
+  switch (g_mode) {
+    case Mode::NORMAL:      renderNormal(nowMs);      break;
+    case Mode::MANUAL:      renderManual(nowMs);      break;
+    case Mode::WIFI_SELECT: renderWifiSelect(nowMs);  break;
+  }
 
   delay(10);
 }
