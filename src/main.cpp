@@ -2,9 +2,11 @@
 //  main.cpp  —  Hokoro: Atom Matrix Office Status Indicator
 //
 //  通常モード (NORMAL):
-//    - iCal の直近予定を取得
-//    - 「残り時間ドット表示」と「MTG スクロール」をトグル表示
-//      (予定が進行中のときのみ。予定が無ければ全消灯=待機)
+//    - Cloudflare Worker の予定 JSON を取得
+//    - 進行中  : 残量ドット ⇄ MTG スクロールをトグル表示
+//    - 5分前  : 増加ドット ⇄ 開始時刻 (HH:MM) をトグル表示 (橙黄)
+//    - 超過   : 赤ドット全点灯・点滅
+//    - 待機   : 消灯
 //  手動ステータスモード (MANUAL):
 //    - ボタン短押しで LUNCH → AWAY → BREAK を巡回
 //    - 各ステータス文字を横スクロール表示
@@ -37,6 +39,7 @@ static const uint32_t BLINK_MS        = 500;            // 超過点滅間隔
 static const uint32_t LONGPRESS_MS    = 2000;           // NORMAL/MANUAL→WIFI_SELECT 入りの長押し閾値
 static const uint32_t LONGPRESS_WS_MS = 1000;           // WIFI_SELECT 中の確定長押し閾値
 static const uint32_t DOUBLE_CLICK_MS = 400;            // ダブルクリック判定窓 (NORMAL モードのみ)
+static const long     PRE_WARN_SEC    = 5 * 60;         // 開始 N 秒前から予告表示
 
 // ---------------- モード定義 ----------------
 enum class Mode { NORMAL, MANUAL, WIFI_SELECT, FONT_TEST };
@@ -305,6 +308,11 @@ static void handleButton() {
 }
 
 // ---------------- 通常モード描画 ----------------
+//   状態優先順位:
+//     1. 進行中の予定 (start <= now <= end)             → 残量ドット ⇄ MTG
+//     2. 5分前予告 (0 < start - now <= PRE_WARN_SEC)    → 増加ドット ⇄ 開始時刻
+//     3. 超過点滅 (end < now <= end + grace)            → 赤点滅
+//     4. idle                                          → 消灯
 static void renderNormal(uint32_t nowMs) {
 #ifndef HOKORO_SIM
   // ポーリング（実機ビルドのみ。シミュレータでは Wi-Fi/取得をスキップ）
@@ -321,57 +329,116 @@ static void renderNormal(uint32_t nowMs) {
 
   time_t now = nowJst();
 
-  // 現在進行中 or 直近終了 (超過点滅) の予定を選出
-  // dismiss 済の予定は除外される
+  // 進行中 or 直近終了の予定を選出
   bool isOver = false;
   schedule::Event ev = schedule::currentOrJustEnded(g_eventList, now, isOver, g_dismissedEnd);
-  g_currentActiveEvent = ev;   // ダブルクリックハンドラ参照用にキャッシュ
 
-  // 状態遷移時のみログ出力（active 変化 or over 変化）
+  // 5分前予告候補 (進行中時は不要なのでスキップして高速化)
+  bool isInProgress = (ev.start != 0 && !isOver);
+  schedule::Event upcoming;
+  if (!isInProgress) {
+    upcoming = schedule::upcomingWithin(g_eventList, now, PRE_WARN_SEC, g_dismissedEnd);
+  }
+
+  // 状態遷移ログ (4状態いずれかが変わったとき)
   static time_t s_lastStart = -1;
   static bool   s_lastOver  = false;
-  if (ev.start != s_lastStart || isOver != s_lastOver) {
-    if (ev.start != 0) {
-      Serial.printf("[sched] active: start=%s end=%s now=%s over=%d\n",
-                    fmtJst(ev.start).c_str(),
-                    fmtJst(ev.end).c_str(),
-                    fmtJst(now).c_str(),
-                    isOver ? 1 : 0);
+  static time_t s_lastUpcomingStart = -1;
+  if (ev.start != s_lastStart || isOver != s_lastOver
+      || upcoming.start != s_lastUpcomingStart) {
+    if (isInProgress) {
+      Serial.printf("[sched] active: start=%s end=%s now=%s\n",
+                    fmtJst(ev.start).c_str(), fmtJst(ev.end).c_str(),
+                    fmtJst(now).c_str());
+    } else if (upcoming.start != 0) {
+      long secToStart = upcoming.start - now;
+      Serial.printf("[sched] prewarn: start=%s (%lds away) now=%s\n",
+                    fmtJst(upcoming.start).c_str(), (long)secToStart,
+                    fmtJst(now).c_str());
+    } else if (ev.start != 0 && isOver) {
+      Serial.printf("[sched] over: end=%s now=%s\n",
+                    fmtJst(ev.end).c_str(), fmtJst(now).c_str());
     } else {
       Serial.printf("[sched] idle (now=%s)\n", fmtJst(now).c_str());
     }
     s_lastStart = ev.start;
     s_lastOver  = isOver;
-  }
-
-  if (ev.start == 0) { M5.dis.clear(); return; }  // 待機
-
-  long total = ev.end - ev.start;
-  long left  = ev.end - now;
-
-  // 表示トグル（残量ドット ⇄ MTG スクロール）
-  if (nowMs - g_lastToggle >= TOGGLE_MS) {
+    s_lastUpcomingStart = upcoming.start;
+    // 状態が変わったらトグルとスクロールをリセット
     g_lastToggle = nowMs;
-    g_showProg = !g_showProg;
-    if (!g_showProg) setScrollText("MTG");
+    g_showProg = true;
+    g_scrollOff = -5;
   }
 
-  if (isOver) {
-    if (nowMs - g_lastBlink >= BLINK_MS) { g_lastBlink = nowMs; g_blinkOn = !g_blinkOn; }
+  // ---------------- 状態別描画 ----------------
+  if (isInProgress) {
+    g_currentActiveEvent = ev;          // ダブルクリックで dismiss 可
+    long total = ev.end - ev.start;
+    long left  = ev.end - now;
+    if (nowMs - g_lastToggle >= TOGGLE_MS) {
+      g_lastToggle = nowMs;
+      g_showProg = !g_showProg;
+      if (!g_showProg) setScrollText("MTG");
+    }
+    if (g_showProg) {
+      int lit = (total > 0) ? (int)((left * 25) / total) : 0;
+      disp::drawProgress(lit, disp::COL_PROG, false, false);
+    } else {
+      if (nowMs - g_lastScroll >= SCROLL_STEP_MS) {
+        g_lastScroll = nowMs;
+        disp::drawScrollFrame(g_cols, g_nCols, g_scrollOff, disp::COL_MTG);
+        if (++g_scrollOff > (int)g_nCols) g_scrollOff = -5;
+      }
+    }
+    return;
+  }
+
+  if (upcoming.start != 0) {
+    g_currentActiveEvent = upcoming;    // 予告中も dismiss 可 (この予定を消したい場合)
+    long secToStart = upcoming.start - now;
+    if (secToStart < 0) secToStart = 0;
+    if (secToStart > PRE_WARN_SEC) secToStart = PRE_WARN_SEC;
+    int lit = (int)(((PRE_WARN_SEC - secToStart) * 25) / PRE_WARN_SEC);
+    if (lit > 25) lit = 25;
+    if (lit < 0)  lit = 0;
+
+    if (nowMs - g_lastToggle >= TOGGLE_MS) {
+      g_lastToggle = nowMs;
+      g_showProg = !g_showProg;
+      if (!g_showProg) {
+        // 開始時刻 "HH:MM" (JST) をスクロールテキストに
+        time_t jst = upcoming.start + 9 * 3600;
+        struct tm tm;
+        gmtime_r(&jst, &tm);
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
+        setScrollText(String(buf));
+      }
+    }
+    if (g_showProg) {
+      disp::drawProgress(lit, disp::COL_PREWARN, false, false);
+    } else {
+      if (nowMs - g_lastScroll >= SCROLL_STEP_MS) {
+        g_lastScroll = nowMs;
+        disp::drawScrollFrame(g_cols, g_nCols, g_scrollOff, disp::COL_PREWARN);
+        if (++g_scrollOff > (int)g_nCols) g_scrollOff = -5;
+      }
+    }
+    return;
+  }
+
+  if (ev.start != 0 && isOver) {
+    g_currentActiveEvent = ev;          // ダブルクリックで dismiss 可
+    if (nowMs - g_lastBlink >= BLINK_MS) {
+      g_lastBlink = nowMs; g_blinkOn = !g_blinkOn;
+    }
     disp::drawProgress(0, disp::COL_OVER, true, g_blinkOn);
     return;
   }
 
-  if (g_showProg) {
-    int lit = (total > 0) ? (int)((left * 25) / total) : 0;
-    disp::drawProgress(lit, disp::COL_PROG, false, false);
-  } else {
-    if (nowMs - g_lastScroll >= SCROLL_STEP_MS) {
-      g_lastScroll = nowMs;
-      disp::drawScrollFrame(g_cols, g_nCols, g_scrollOff, disp::COL_MTG);
-      if (++g_scrollOff > (int)g_nCols) g_scrollOff = -5;
-    }
-  }
+  // idle
+  g_currentActiveEvent = schedule::Event();
+  M5.dis.clear();
 }
 
 // ---------------- 手動モード描画 ----------------

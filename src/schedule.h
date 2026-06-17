@@ -79,6 +79,23 @@ inline List fetchAll(const char* url) {
 // 該当無しなら start==0 のままの Event が返る。
 //   dismissedEnd != 0 のとき、end がこれと一致する予定は active 選定から除外
 //   (ユーザーの「終了確定」操作で dismiss された予定を二度と拾わないため)。
+// 開始までの残り時間が withinSec 以内の最も近い未来予定を返す。
+// dismiss 済 (end が dismissedEnd と一致) はスキップ。
+inline Event upcomingWithin(const List& list, time_t now, long withinSec,
+                            time_t dismissedEnd = 0) {
+  Event ret;
+  for (int i = 0; i < list.count; i++) {
+    const Event& e = list.events[i];
+    if (dismissedEnd != 0 && e.end == dismissedEnd) continue;
+    if (e.start > now && (e.start - now) <= withinSec) {
+      if (ret.start == 0 || e.start < ret.start) {
+        ret = e;
+      }
+    }
+  }
+  return ret;
+}
+
 inline Event currentOrJustEnded(const List& list, time_t now,
                                 bool& outIsOver,
                                 time_t dismissedEnd = 0,

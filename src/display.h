@@ -19,8 +19,9 @@ constexpr uint32_t COL_MTG    = 0xC03000; // MTG: 橙赤
 constexpr uint32_t COL_LUNCH  = 0xA04000; // LUNCH: 橙
 constexpr uint32_t COL_AWAY   = 0x6010A0; // AWAY: 紫
 constexpr uint32_t COL_BREAK  = 0x108040; // BREAK: 緑
-constexpr uint32_t COL_PROG   = 0x104060; // 残量バー: 青系
-constexpr uint32_t COL_OVER   = 0xC00000; // 超過: 赤（点滅）
+constexpr uint32_t COL_PROG    = 0x104060; // 残量バー: 青系
+constexpr uint32_t COL_OVER    = 0xC00000; // 超過: 赤（点滅）
+constexpr uint32_t COL_PREWARN = 0xC07000; // 5分前予告: 橙黄系（増加ドット & 時刻スクロール）
 
 // WIFI_SELECT モード用
 constexpr uint32_t COL_WIFI     = 0x0080C0; // 選択中インジケータ: シアン
