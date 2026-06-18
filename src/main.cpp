@@ -33,6 +33,7 @@
 
 // ---------------- 設定値 ----------------
 static const uint32_t POLL_MS         = 60UL * 1000UL;  // 予定 JSON 取得間隔(1分)
+static const uint32_t WIFI_CHECK_MS   = 30UL * 1000UL;  // Wi-Fi 切断監視間隔(30秒)
 static const uint32_t SCROLL_STEP_MS  = 200;            // スクロール速度
 static const uint32_t TOGGLE_MS       = 10000;          // 残量/MTG切替間隔
 static const uint32_t BLINK_MS        = 500;            // 超過点滅間隔
@@ -60,6 +61,13 @@ static bool     g_btnLongFired    = false;
 
 // ダブルクリック検出用 (NORMAL モードのみ)
 static uint32_t g_btnLastReleaseMs = 0;   // 0 = pending なし
+
+// MANUAL モード突入時刻 (経過時間ドット表示用、ステータス遷移ごとにリセット)
+static uint32_t g_manualStartMs = 0;
+
+// WIFI_SELECT 進入前のモード (退出時に復元するため記憶)
+static Mode    g_modeBeforeWifiSelect   = Mode::NORMAL;
+static Manual  g_manualBeforeWifiSelect = Manual::LUNCH;
 
 // 「終了確定」状態
 static schedule::Event g_currentActiveEvent;   // renderNormal で毎フレーム更新
@@ -166,6 +174,18 @@ static void syncTime() {
 }
 
 // ---------------- ボタン ----------------
+// WIFI_SELECT 退出時の共通処理: 進入前のモードへ復元
+static void exitWifiSelectTo(const char* via) {
+  g_mode = g_modeBeforeWifiSelect;
+  if (g_mode == Mode::MANUAL) {
+    g_manual = g_manualBeforeWifiSelect;
+    setScrollText(manualLabel());
+    Serial.printf("[wifi-select] -> MANUAL/%s (%s)\n", manualLabel(), via);
+  } else {
+    Serial.printf("[wifi-select] -> NORMAL (%s)\n", via);
+  }
+}
+
 // 確定処理: 候補プロファイルへの接続切替
 static void confirmWifiSelection() {
   Serial.printf("[wifi-select] confirming profile #%d\n", g_wifiCandidate + 1);
@@ -184,9 +204,8 @@ static void confirmWifiSelection() {
   if (ok) {
     wifip::saveCurrent(g_wifiCandidate);
     syncTime();           // NTP 再同期
-    g_lastPoll = 0;       // iCal 即時再取得
-    g_mode = Mode::NORMAL;
-    Serial.println("[wifi-select] -> NORMAL");
+    g_lastPoll = 0;       // 即時スケジュール再取得
+    exitWifiSelectTo("confirmed");
   } else {
     // 失敗時は WIFI_SELECT に留まり、別プロファイルを試せるようにする
     Serial.println("[wifi-select] connection failed, staying in WIFI_SELECT");
@@ -199,14 +218,17 @@ static void onButtonShortPress() {
     g_mode = Mode::MANUAL;
     g_manual = Manual::LUNCH;
     setScrollText(manualLabel());
+    g_manualStartMs = millis();
     Serial.println("[btn] -> LUNCH");
   } else if (g_mode == Mode::MANUAL) {
     switch (g_manual) {
       case Manual::LUNCH:
         g_manual = Manual::AWAY;  setScrollText(manualLabel());
+        g_manualStartMs = millis();
         Serial.println("[btn] -> AWAY"); break;
       case Manual::AWAY:
         g_manual = Manual::BREAK; setScrollText(manualLabel());
+        g_manualStartMs = millis();
         Serial.println("[btn] -> BREAK"); break;
       case Manual::BREAK:
         g_mode = Mode::NORMAL;
@@ -231,9 +253,14 @@ static void onButtonShortPress() {
 // 長押し: WIFI_SELECT への遷移、WIFI_SELECT 内での確定、または FONT_TEST 退出
 static void onButtonLongPress() {
   if (g_mode == Mode::NORMAL || g_mode == Mode::MANUAL) {
+    // 退出時の復元のため、進入前のモードを保存
+    g_modeBeforeWifiSelect = g_mode;
+    g_manualBeforeWifiSelect = g_manual;
     g_mode = Mode::WIFI_SELECT;
     g_wifiCandidate = wifip::current();
-    Serial.printf("[btn-long] -> WIFI_SELECT (current=#%d)\n", g_wifiCandidate + 1);
+    Serial.printf("[btn-long] -> WIFI_SELECT (current=#%d, from=%s)\n",
+                  g_wifiCandidate + 1,
+                  g_modeBeforeWifiSelect == Mode::MANUAL ? manualLabel() : "NORMAL");
   } else if (g_mode == Mode::WIFI_SELECT) {
     confirmWifiSelection();
   } else if (g_mode == Mode::FONT_TEST) {
@@ -442,11 +469,25 @@ static void renderNormal(uint32_t nowMs) {
 }
 
 // ---------------- 手動モード描画 ----------------
+//   文字スクロール ⇄ 経過時間ドット (1ドット=1分) を TOGGLE_MS でトグル。
+//   ステータス遷移時に g_manualStartMs を更新し、各ステータスごとの経過を表示。
 static void renderManual(uint32_t nowMs) {
-  if (nowMs - g_lastScroll >= SCROLL_STEP_MS) {
-    g_lastScroll = nowMs;
-    disp::drawScrollFrame(g_cols, g_nCols, g_scrollOff, manualColor());
-    if (++g_scrollOff > (int)g_nCols) g_scrollOff = -5;
+  if (nowMs - g_lastToggle >= TOGGLE_MS) {
+    g_lastToggle = nowMs;
+    g_showProg = !g_showProg;
+  }
+
+  if (g_showProg) {
+    // 経過分数を 0..25 ドットで点灯 (25分以降は満タン)
+    uint32_t elapsedMin = (nowMs - g_manualStartMs) / 60000UL;
+    int lit = (elapsedMin > 25) ? 25 : (int)elapsedMin;
+    disp::drawProgress(lit, manualColor(), false, false);
+  } else {
+    if (nowMs - g_lastScroll >= SCROLL_STEP_MS) {
+      g_lastScroll = nowMs;
+      disp::drawScrollFrame(g_cols, g_nCols, g_scrollOff, manualColor());
+      if (++g_scrollOff > (int)g_nCols) g_scrollOff = -5;
+    }
   }
 }
 
@@ -500,11 +541,36 @@ void setup() {
   Serial.println("[setup] done, entering loop");
 }
 
+// Wi-Fi 切断監視: WIFI_CHECK_MS ごとに status を見て、切れていれば再接続を試みる。
+static void watchWifi(uint32_t nowMs) {
+#ifdef HOKORO_SIM
+  (void)nowMs;
+  return;
+#else
+  static uint32_t s_lastCheck = 0;
+  if (nowMs - s_lastCheck < WIFI_CHECK_MS) return;
+  s_lastCheck = nowMs;
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  Serial.println("[wifi] connection lost, attempting reconnect...");
+  if (wifip::connectAuto()) {
+    syncTime();         // 時刻ドリフト是正のため NTP 再同期
+    g_lastPoll = 0;     // 復帰直後にスケジュール再取得
+    // WIFI_SELECT で confirm 失敗後に取り残されている場合は進入前モードへ復帰
+    if (g_mode == Mode::WIFI_SELECT) {
+      exitWifiSelectTo("auto-recovered");
+    }
+  }
+#endif
+}
+
 void loop() {
   M5.update();
   handleButton();
 
   uint32_t nowMs = millis();
+  watchWifi(nowMs);
+
   switch (g_mode) {
     case Mode::NORMAL:      renderNormal(nowMs);      break;
     case Mode::MANUAL:      renderManual(nowMs);      break;

@@ -5,6 +5,14 @@
 #include <ArduinoJson.h>
 #include <time.h>
 
+// TODO(Phase 3): TLS 証明書 pin 化
+//   現在は setInsecure() で証明書検証を省略している。本実装は以下のいずれかで
+//   実機検証可能な証明書データを取得後に有効化する:
+//     - openssl s_client -connect hokoro.<sub>.workers.dev:443 -showcerts で
+//       実際のチェーンを取得し、適切な root CA (例: ISRG Root X1) を pin
+//     - もしくは ESP-IDF の CONFIG_MBEDTLS_CERTIFICATE_BUNDLE を有効化した
+//       PlatformIO ビルドへ切替えて setCACertBundle() を使用
+
 // =====================================================================
 //  schedule.h  —  Cloudflare Worker からの予定 JSON 取得
 //
@@ -39,7 +47,7 @@ struct List {
 inline List fetchAll(const char* url) {
   List result;
   WiFiClientSecure client;
-  client.setInsecure();    // TLS 検証は省略。Phase 3 で setCACert へ
+  client.setInsecure();    // TODO: 上記コメント参照、TLS 証明書 pin 化が必要
   HTTPClient http;
   if (!http.begin(client, url)) {
     Serial.println("[sched] http.begin FAILED");

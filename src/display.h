@@ -148,13 +148,14 @@ inline void drawFill(uint32_t color) {
   for (int i = 0; i < 25; ++i) put(i, color);
 }
 
-// WIFI_SELECT モード用: 上段(row 0) に N 個ドットを点灯してプロファイル番号を表現。
+// WIFI_SELECT モード用: 物理 top row に N 個ドットを点灯してプロファイル番号を表現。
 //   profile 1 → 1 ドット、profile 3 → 3 ドット
+//   put() の縦反転を経て物理上段に出るよう logical row 4 (=bit4) を指定。
 inline void drawProfileIndicator(int oneBasedIndex, uint32_t color) {
   M5.dis.clear();
   int n = constrain(oneBasedIndex, 0, 5);
   for (int x = 0; x < n; ++x) {
-    put(0 * 5 + x, color);  // row 0
+    put(4 * 5 + x, color);  // logical row 4 → 縦反転後の physical row 0
   }
 }
 
