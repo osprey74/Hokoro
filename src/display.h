@@ -22,6 +22,7 @@ constexpr uint32_t COL_BREAK  = 0x108040; // BREAK: 緑
 constexpr uint32_t COL_PROG    = 0x104060; // 残量バー: 青系
 constexpr uint32_t COL_OVER    = 0xC00000; // 超過: 赤（点滅）
 constexpr uint32_t COL_PREWARN = 0xC07000; // 5分前予告: 橙黄系（増加ドット & 時刻スクロール）
+constexpr uint32_t COL_CLOCK   = 0x202040; // idle 時の時計: 控えめな紺紫
 
 // WIFI_SELECT モード用
 constexpr uint32_t COL_WIFI     = 0x0080C0; // 選択中インジケータ: シアン
